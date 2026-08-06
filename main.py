@@ -1,8 +1,14 @@
 """
 main.py
-v4.0 - CleanDrive Bot (multi-user, Google Drive backend)
+v4.1 - CleanDrive Bot (multi-user, Google Drive backend)
 
 Changelog:
+- v4.1: moved "чистить метаданные?" / "обезличить имена?" out of the
+        per-upload flow and into standing settings, toggled anytime via
+        /settings (checkboxes, persisted in Supabase). The upload flow is
+        now just: files -> folder name -> link. Settings are applied
+        automatically and silently (the note before the folder-name prompt
+        just states what will happen, doesn't ask).
 - v4.0: storage backend Yandex.Disk -> Google Drive. Reason: Yandex forces
         login for public FOLDER links (only individual files are login-free
         by design), which broke the "anyone with the link, no auth" goal.
@@ -35,7 +41,7 @@ Changelog:
 - v2.1: optional "обезличить имена" -> rename to 001, 002, 003…
 - v2.0: multi-user OAuth, optional cleaning, shareable link.
 
-Flow: files -> metadata report (+GPS) -> clean? -> anonymize names? ->
+Flow: files -> (settings applied silently: clean? anonymize names?) ->
 folder name -> upload to user's Google Drive (per-file, continue on error) ->
 report + public link -> delete succeeded messages from chat.
 
@@ -62,7 +68,13 @@ from aiogram.types import (
 )
 
 from config import config
-from db import save_tokens, get_tokens, delete_user
+from db import (
+    save_tokens,
+    get_tokens,
+    delete_user,
+    get_settings,
+    set_setting,
+)
 from exif_utils import inspect_metadata, strip_exif
 from drive_utils import (
     ensure_folder,
@@ -91,7 +103,6 @@ pending_singles_tasks: dict[int, asyncio.Task] = {}
 
 
 class Flow(StatesGroup):
-    waiting_rename_choice = State()
     waiting_folder_name = State()
 
 
@@ -102,12 +113,14 @@ async def start(message: Message):
     if get_tokens(uid):
         await message.answer(
             "Ты уже подключил Google Drive ✅\n\n"
-            "Пришли фото или файлы (можно альбомом) — я спрошу, чистить ли "
-            "метаданные, и загружу результат в папку на твоём Диске. После "
-            "успешной загрузки я удалю исходные сообщения из чата, чтобы они "
-            "не занимали место.\n\n"
+            "Пришли фото или файлы (можно альбомом) — я загружу их в папку на "
+            "твоём Диске (спрошу только имя папки) и после успешной загрузки "
+            "удалю исходные сообщения из чата, чтобы они не занимали место.\n\n"
+            "Чистка метаданных и обезличивание имён — настраиваются заранее в "
+            "/settings, не спрашиваю об этом при каждой загрузке.\n\n"
             "⚠️ Присылай как файл (📎 → Файл), а не как обычное фото — иначе "
             "Telegram сам пережмёт изображение.\n\n"
+            "/settings — настройки очистки/переименования\n"
             "/logout — отключить Диск."
         )
         return
@@ -135,6 +148,48 @@ async def logout(message: Message):
         "Токен удалён из базы. Доступ приложения можно также отозвать вручную "
         "на странице myaccount.google.com/permissions."
     )
+
+
+def _settings_keyboard(s: dict) -> InlineKeyboardMarkup:
+    clean_mark = "✅" if s["clean_metadata"] else "⬜"
+    rename_mark = "✅" if s["anonymize_names"] else "⬜"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"{clean_mark} Чистить метаданные (EXIF/GPS)",
+            callback_data="toggle:clean_metadata",
+        )],
+        [InlineKeyboardButton(
+            text=f"{rename_mark} Обезличивать имена (001, 002…)",
+            callback_data="toggle:anonymize_names",
+        )],
+    ])
+
+
+@dp.message(Command("settings"))
+async def settings_cmd(message: Message):
+    if not get_tokens(message.from_user.id):
+        await message.answer("Сначала подключи Google Drive командой /start.")
+        return
+    s = get_settings(message.from_user.id)
+    await message.answer(
+        "⚙️ Настройки загрузки — применяются к каждой следующей загрузке "
+        "автоматически, спрашивать не буду:",
+        reply_markup=_settings_keyboard(s),
+    )
+
+
+@dp.callback_query(F.data.startswith("toggle:"))
+async def on_toggle_setting(cq: CallbackQuery):
+    field = cq.data.split(":", 1)[1]
+    s = get_settings(cq.from_user.id)
+    if field not in s:
+        await cq.answer()
+        return
+    new_value = not s[field]
+    set_setting(cq.from_user.id, field, new_value)
+    s[field] = new_value
+    await cq.message.edit_reply_markup(reply_markup=_settings_keyboard(s))
+    await cq.answer("Обновлено")
 
 
 # ------------------------------------------------------------ media intake ---
@@ -200,9 +255,15 @@ async def _finish_group(gid: str, state: FSMContext, chat_id: int):
 
 
 async def _process(messages: list[Message], state: FSMContext, chat_id: int):
-    """Download each message's media and build a per-file tracking list.
+    """Download each message's media, apply the user's standing settings
+    (clean metadata / anonymize names — see /settings) immediately, and go
+    straight to asking for a folder name. No per-upload questions anymore.
+
     Each item carries its own message_id so we know which chat message to
     delete later, and its own status once uploaded."""
+    telegram_id = messages[0].from_user.id
+    settings = get_settings(telegram_id)
+
     work_dir = os.path.join(config.TEMP_DIR, str(chat_id), uuid.uuid4().hex)
     os.makedirs(work_dir, exist_ok=True)
 
@@ -224,35 +285,7 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
         shutil.rmtree(work_dir, ignore_errors=True)
         return
 
-    await state.update_data(items=items, work_dir=work_dir)
-
-    note = f"Получил {len(items)} файл(ов)."
-    if gps_count:
-        note += f"\n⚠️ В {gps_count} из них есть GPS-координаты съёмки."
-    note += "\n\nЧистить метаданные перед загрузкой?"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🧹 Очистить метаданные", callback_data="clean:yes")],
-        [InlineKeyboardButton(text="📤 Загрузить как есть", callback_data="clean:no")],
-        [InlineKeyboardButton(text="❌ Отменить загрузку", callback_data="cancel")],
-    ])
-    await bot.send_message(chat_id, note, reply_markup=kb)
-
-
-# ------------------------------------------------------------ clean choice ---
-@dp.callback_query(F.data.startswith("clean:"))
-async def on_clean_choice(cq: CallbackQuery, state: FSMContext):
-    do_clean = cq.data.split(":")[1] == "yes"
-    data = await state.get_data()
-    items = data.get("items", [])
-    work_dir = data.get("work_dir")
-
-    if not items:
-        await cq.message.edit_text("Файлы не найдены, начни заново.")
-        await cq.answer()
-        return
-
-    if do_clean:
+    if settings["clean_metadata"]:
         clean_dir = os.path.join(work_dir, "clean")
         os.makedirs(clean_dir, exist_ok=True)
         for it in items:
@@ -267,31 +300,38 @@ async def on_clean_choice(cq: CallbackQuery, state: FSMContext):
         for it in items:
             it["upload_path"] = it["path"]
 
-    await state.update_data(items=items, cleaned=do_clean)
-    await state.set_state(Flow.waiting_rename_choice)
+    width = max(3, len(str(len(items))))
+    for i, it in enumerate(items, start=1):
+        if settings["anonymize_names"]:
+            ext = os.path.splitext(it["upload_path"])[1] or ".jpg"
+            it["upload_name"] = f"{i:0{width}d}{ext}"
+        else:
+            it["upload_name"] = it["orig_name"]
 
-    verb = "Почистил" if do_clean else "Оставил как есть"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔢 Да, переименовать в 001, 002…",
-                              callback_data="rename:yes")],
-        [InlineKeyboardButton(text="📄 Нет, оставить имена",
-                              callback_data="rename:no")],
+    await state.update_data(items=items, work_dir=work_dir)
+    await state.set_state(Flow.waiting_folder_name)
+
+    note = f"Получил {len(items)} файл(ов)."
+    if gps_count:
+        note += f"\n⚠️ В {gps_count} из них есть GPS-координаты съёмки."
+    note += (
+        f"\nМетаданные: {'чищу' if settings['clean_metadata'] else 'оставляю как есть'}. "
+        f"Имена: {'обезличиваю (001, 002…)' if settings['anonymize_names'] else 'оставляю оригинальные'}. "
+        "(меняется в /settings)"
+    )
+    note += "\n\nУкажите имя папки на Google Drive. Если такой папки нет, она будет создана."
+
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отменить загрузку", callback_data="cancel")],
     ])
-    await cq.message.edit_text(
-        f"{verb} {len(items)} файл(ов).\n\n"
-        "Обезличить имена файлов? Имя файла тоже может выдавать инфу.",
-        reply_markup=kb,
-    )
-    await cq.answer()
+    await bot.send_message(chat_id, note, reply_markup=cancel_kb)
 
 
 # ------------------------------------------------------------------ cancel ---
 @dp.callback_query(F.data == "cancel")
 async def on_cancel(cq: CallbackQuery, state: FSMContext):
-    """Works from any step of the flow (clean choice, rename choice, or
-    folder-name prompt) — wipes downloaded/cleaned temp files and clears
-    FSM state without uploading anything."""
+    """Wipes downloaded/cleaned temp files and clears FSM state without
+    uploading anything."""
     data = await state.get_data()
     work_dir = data.get("work_dir")
     if work_dir and os.path.exists(work_dir):
@@ -299,43 +339,6 @@ async def on_cancel(cq: CallbackQuery, state: FSMContext):
     await state.clear()
     await cq.message.edit_text("❌ Отменено. Ничего не загружено, временные файлы удалены.")
     await cq.answer("Отменено")
-
-
-# ------------------------------------------------------------ rename choice --
-@dp.callback_query(Flow.waiting_rename_choice, F.data.startswith("rename:"))
-async def on_rename_choice(cq: CallbackQuery, state: FSMContext):
-    do_rename = cq.data.split(":")[1] == "yes"
-    data = await state.get_data()
-    items = data.get("items", [])
-
-    if not items:
-        await cq.message.edit_text("Файлы не найдены, начни заново.")
-        await state.clear()
-        await cq.answer()
-        return
-
-    width = max(3, len(str(len(items))))
-    for i, it in enumerate(items, start=1):
-        if do_rename:
-            ext = os.path.splitext(it["upload_path"])[1] or ".jpg"
-            it["upload_name"] = f"{i:0{width}d}{ext}"
-        else:
-            it["upload_name"] = it["orig_name"]
-
-    await state.update_data(items=items, rename=do_rename)
-    await state.set_state(Flow.waiting_folder_name)
-
-    tail = ("Имена будут 001, 002, 003…" if do_rename
-            else "Оригинальные имена сохранены.")
-    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отменить загрузку", callback_data="cancel")],
-    ])
-    await cq.message.edit_text(
-        f"Ок. {tail}\n\n"
-        "Укажите имя папки на Google Drive. Если такой папки нет, она будет создана.",
-        reply_markup=cancel_kb,
-    )
-    await cq.answer()
 
 
 # ------------------------------------------------------------ folder + up ----
