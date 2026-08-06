@@ -1,6 +1,10 @@
 """
 oauth.py
-v4.0 - per-user Google OAuth (authorization-code flow, plain REST via aiohttp)
+v4.1 - per-user Google OAuth (authorization-code flow, plain REST via aiohttp)
+
+Changelog:
+- v4.1: added get_user_email() — needed to label multiple connected Google
+        accounts distinctly in /accounts.
 
 Each user authorizes their own Google Drive on Google's own consent page.
 The bot only receives an authorization code -> tokens; it never sees the
@@ -15,6 +19,7 @@ from config import config
 
 AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
+USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
 
 # short-lived map: state nonce -> telegram_id (survives only until callback)
 pending_states: dict[str, int] = {}
@@ -61,6 +66,18 @@ async def exchange_code(state: str, code: str) -> tuple[int, str, str]:
             "to revoke access at myaccount.google.com/permissions and retry)"
         )
     return telegram_id, payload["access_token"], payload["refresh_token"]
+
+
+async def get_user_email(access_token: str) -> str:
+    """Used to label multiple connected accounts distinctly in /accounts."""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"}
+        ) as resp:
+            data = await resp.json()
+            if resp.status != 200:
+                raise ValueError(f"userinfo failed: {data}")
+            return data.get("email", "unknown@account")
 
 
 async def refresh_access_token(refresh_token: str) -> dict:
