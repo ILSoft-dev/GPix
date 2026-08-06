@@ -1,8 +1,31 @@
 """
 main.py
-v4.1 - CleanDrive Bot (multi-user, Google Drive backend)
+v5.2 - CleanDrive Bot (multi-user, multi-account, Google Drive backend, admin-only)
 
 Changelog:
+- v5.2: fixed the long freeze after sending files. Root cause: exiftool
+        calls (inspect_metadata / strip_exif) are blocking OS subprocess
+        calls; running them directly in an async handler froze the ENTIRE
+        bot (no other updates processed) for the full duration. Now offloaded
+        via asyncio.to_thread, and downloads / exif calls / Drive uploads all
+        run concurrently (bounded by semaphores — DOWNLOAD_CONCURRENCY,
+        EXIF_CONCURRENCY, UPLOAD_CONCURRENCY) instead of strictly one-by-one.
+        Also added a Telegram command menu (the blue "menu" button) via
+        bot.set_my_commands() at startup, listing /start /accounts /settings
+        /logout.
+- v5.1: added a global IsAdmin filter (dp.message.filter / dp.callback_query.filter)
+        so ONLY config.ADMIN_ID can interact with the bot at all — anyone else's
+        messages are dropped before reaching any handler, silently. This closes
+        the "any stranger who finds the bot can connect their own Google
+        account and use our infra/quota" exposure raised earlier.
+- v5.0: multiple Google accounts per Telegram user. /start now offers
+        "add another account" once one is connected; /accounts lists all
+        connected accounts and lets you tap one to make it active (that's
+        the one uploads go to). Any Google account can connect — not just
+        the one that created the OAuth client — since the app is Published
+        (In Production) with a non-sensitive scope, so there's no test-user
+        allow-list. Settings (clean/anonymize) are now independent of which
+        account is active — one set of preferences per Telegram user.
 - v4.1: moved "чистить метаданные?" / "обезличить имена?" out of the
         per-upload flow and into standing settings, toggled anytime via
         /settings (checkboxes, persisted in Supabase). The upload flow is
@@ -42,8 +65,8 @@ Changelog:
 - v2.0: multi-user OAuth, optional cleaning, shareable link.
 
 Flow: files -> (settings applied silently: clean? anonymize names?) ->
-folder name -> upload to user's Google Drive (per-file, continue on error) ->
-report + public link -> delete succeeded messages from chat.
+folder name -> upload to the active Google account's Drive (per-file,
+continue on error) -> report + public link -> delete succeeded messages.
 
 Runs an aiohttp server (OAuth callback + Render port) alongside aiogram polling.
 """
@@ -56,11 +79,12 @@ import uuid
 import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -69,11 +93,14 @@ from aiogram.types import (
 
 from config import config
 from db import (
-    save_tokens,
-    get_tokens,
-    delete_user,
     get_settings,
     set_setting,
+    add_or_update_account,
+    list_accounts,
+    get_active_account,
+    set_active_account,
+    update_account_tokens,
+    remove_all_accounts,
 )
 from exif_utils import inspect_metadata, strip_exif
 from drive_utils import (
@@ -82,12 +109,26 @@ from drive_utils import (
     publish_and_get_url,
     GoogleAuthError,
 )
-from oauth import build_auth_url, exchange_code, refresh_access_token
+from oauth import build_auth_url, exchange_code, refresh_access_token, get_user_email
 
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+
+class IsAdmin(BaseFilter):
+    """Global gate: only config.ADMIN_ID may use the bot. Everyone else's
+    messages/callbacks are simply not handled — no reply, no acknowledgment
+    that the bot exists or does anything. Applied once here to the whole
+    dispatcher, so every handler below is covered automatically."""
+    async def __call__(self, event) -> bool:
+        user = event.from_user
+        return user is not None and user.id == config.ADMIN_ID
+
+
+dp.message.filter(IsAdmin())
+dp.callback_query.filter(IsAdmin())
 
 media_groups: dict[str, list[Message]] = {}
 media_group_tasks: dict[str, asyncio.Task] = {}
@@ -107,25 +148,44 @@ class Flow(StatesGroup):
 
 
 # ---------------------------------------------------------------- commands ---
+def _accounts_keyboard(accounts: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for a in accounts:
+        mark = "✅ " if a["is_active"] else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{mark}{a['email']}", callback_data=f"acct:{a['id']}"
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @dp.message(CommandStart())
 async def start(message: Message):
     uid = message.from_user.id
-    if get_tokens(uid):
+    accounts = list_accounts(uid)
+    auth_url = build_auth_url(uid)
+
+    if accounts:
+        active = next((a for a in accounts if a["is_active"]), None)
+        active_email = active["email"] if active else "не выбран — см. /accounts"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Подключить ещё аккаунт", url=auth_url)]
+        ])
         await message.answer(
-            "Ты уже подключил Google Drive ✅\n\n"
-            "Пришли фото или файлы (можно альбомом) — я загружу их в папку на "
-            "твоём Диске (спрошу только имя папки) и после успешной загрузки "
-            "удалю исходные сообщения из чата, чтобы они не занимали место.\n\n"
+            f"Подключено аккаунтов: {len(accounts)}. Активный: {active_email}\n\n"
+            "Пришли фото или файлы (можно альбомом) — загружу на активный "
+            "аккаунт (спрошу только имя папки) и после успешной загрузки "
+            "удалю исходные сообщения из чата.\n\n"
             "Чистка метаданных и обезличивание имён — настраиваются заранее в "
-            "/settings, не спрашиваю об этом при каждой загрузке.\n\n"
+            "/settings.\n\n"
             "⚠️ Присылай как файл (📎 → Файл), а не как обычное фото — иначе "
             "Telegram сам пережмёт изображение.\n\n"
+            "/accounts — посмотреть все аккаунты и переключиться\n"
             "/settings — настройки очистки/переименования\n"
-            "/logout — отключить Диск."
+            "/logout — отключить все аккаунты.",
+            reply_markup=kb,
         )
         return
 
-    auth_url = build_auth_url(uid)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔗 Подключить Google Drive", url=auth_url)]
     ])
@@ -135,17 +195,40 @@ async def start(message: Message):
         "Сначала подключи свой Диск — откроется страница Google, войди и "
         "разреши доступ. Пароль вводится только у Google, я его не вижу. "
         "Доступ ограничен: я вижу только файлы и папки, которые сам создам "
-        "(scope drive.file) — остальной твой Диск мне не виден.",
+        "(scope drive.file) — остальной твой Диск мне не виден.\n\n"
+        "Можно подключить сразу несколько своих Google-аккаунтов и "
+        "переключаться между ними через /accounts.",
         reply_markup=kb,
     )
 
 
+@dp.message(Command("accounts"))
+async def accounts_cmd(message: Message):
+    accounts = list_accounts(message.from_user.id)
+    if not accounts:
+        await message.answer("Нет подключённых аккаунтов. /start чтобы подключить.")
+        return
+    await message.answer(
+        "Твои Google-аккаунты — нажми, чтобы сделать активным для загрузки:",
+        reply_markup=_accounts_keyboard(accounts),
+    )
+
+
+@dp.callback_query(F.data.startswith("acct:"))
+async def on_switch_account(cq: CallbackQuery):
+    account_id = int(cq.data.split(":", 1)[1])
+    set_active_account(cq.from_user.id, account_id)
+    accounts = list_accounts(cq.from_user.id)
+    await cq.message.edit_reply_markup(reply_markup=_accounts_keyboard(accounts))
+    await cq.answer("Активный аккаунт изменён")
+
+
 @dp.message(Command("logout"))
 async def logout(message: Message):
-    delete_user(message.from_user.id)
+    remove_all_accounts(message.from_user.id)
     await message.answer(
-        "Отключил твой Google Drive. Чтобы подключить снова — /start.\n"
-        "Токен удалён из базы. Доступ приложения можно также отозвать вручную "
+        "Отключил все твои Google-аккаунты. Чтобы подключить снова — /start.\n"
+        "Токены удалены из базы. Доступ приложения можно также отозвать вручную "
         "на странице myaccount.google.com/permissions."
     )
 
@@ -167,7 +250,7 @@ def _settings_keyboard(s: dict) -> InlineKeyboardMarkup:
 
 @dp.message(Command("settings"))
 async def settings_cmd(message: Message):
-    if not get_tokens(message.from_user.id):
+    if not get_active_account(message.from_user.id):
         await message.answer("Сначала подключи Google Drive командой /start.")
         return
     s = get_settings(message.from_user.id)
@@ -211,7 +294,7 @@ async def _download(message: Message, dest_dir: str) -> str | None:
 
 @dp.message(F.photo | F.document)
 async def handle_media(message: Message, state: FSMContext):
-    if not get_tokens(message.from_user.id):
+    if not get_active_account(message.from_user.id):
         await message.answer("Сначала подключи Google Drive командой /start.")
         return
 
@@ -254,10 +337,24 @@ async def _finish_group(gid: str, state: FSMContext, chat_id: int):
         await _process(messages, state, chat_id)
 
 
+# Concurrency caps for the steps below — modest by design: Render's free
+# tier has limited CPU, and exiftool spawns a real OS subprocess per call,
+# so too much parallelism there would thrash rather than help. Tune if needed.
+DOWNLOAD_CONCURRENCY = 5
+EXIF_CONCURRENCY = 4
+
+
 async def _process(messages: list[Message], state: FSMContext, chat_id: int):
     """Download each message's media, apply the user's standing settings
     (clean metadata / anonymize names — see /settings) immediately, and go
     straight to asking for a folder name. No per-upload questions anymore.
+
+    Downloads and exiftool calls run concurrently (bounded by semaphores)
+    instead of one-by-one. Crucially, exiftool itself is a blocking OS
+    subprocess call — running it directly in this coroutine would freeze
+    the whole bot (no other messages could be handled) for as long as it
+    takes to process every file. asyncio.to_thread() offloads each call to
+    a worker thread so the event loop stays responsive throughout.
 
     Each item carries its own message_id so we know which chat message to
     delete later, and its own status once uploaded."""
@@ -267,9 +364,16 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
     work_dir = os.path.join(config.TEMP_DIR, str(chat_id), uuid.uuid4().hex)
     os.makedirs(work_dir, exist_ok=True)
 
-    items, gps_count = [], 0
-    for msg in messages:
-        path = await _download(msg, work_dir)
+    dl_sem = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
+
+    async def _download_bounded(msg: Message) -> str | None:
+        async with dl_sem:
+            return await _download(msg, work_dir)
+
+    paths = await asyncio.gather(*[_download_bounded(msg) for msg in messages])
+
+    items = []
+    for msg, path in zip(messages, paths):
         if not path:
             continue
         items.append({
@@ -277,25 +381,37 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
             "path": path,
             "orig_name": os.path.basename(path),
         })
-        if inspect_metadata(path)["has_gps"]:
-            gps_count += 1
 
     if not items:
         await bot.send_message(chat_id, "Не нашёл файлов для обработки.")
         shutil.rmtree(work_dir, ignore_errors=True)
         return
 
+    exif_sem = asyncio.Semaphore(EXIF_CONCURRENCY)
+
+    async def _has_gps(it: dict) -> bool:
+        async with exif_sem:
+            meta = await asyncio.to_thread(inspect_metadata, it["path"])
+            return meta["has_gps"]
+
+    gps_flags = await asyncio.gather(*[_has_gps(it) for it in items])
+    gps_count = sum(1 for flag in gps_flags if flag)
+
     if settings["clean_metadata"]:
         clean_dir = os.path.join(work_dir, "clean")
         os.makedirs(clean_dir, exist_ok=True)
-        for it in items:
+
+        async def _clean_one(it: dict) -> None:
             out = os.path.join(clean_dir, it["orig_name"])
-            try:
-                strip_exif(it["path"], out)
-            except Exception as e:
-                logging.error(f"strip failed {it['path']}: {e}")
-                shutil.copy(it["path"], out)
+            async with exif_sem:
+                try:
+                    await asyncio.to_thread(strip_exif, it["path"], out)
+                except Exception as e:
+                    logging.error(f"strip failed {it['path']}: {e}")
+                    shutil.copy(it["path"], out)
             it["upload_path"] = out
+
+        await asyncio.gather(*[_clean_one(it) for it in items])
     else:
         for it in items:
             it["upload_path"] = it["path"]
@@ -342,33 +458,44 @@ async def on_cancel(cq: CallbackQuery, state: FSMContext):
 
 
 # ------------------------------------------------------------ folder + up ----
-async def _upload_all(tokens: dict, telegram_id: int, items: list[dict],
+UPLOAD_CONCURRENCY = 4
+
+
+async def _upload_all(account: dict, items: list[dict],
                       folder_name: str) -> tuple[list[dict], str]:
-    """Upload every item to the user's Google Drive folder.
-    Continues past individual file failures (records them, doesn't abort).
+    """Upload every item to the user's Google Drive folder, concurrently
+    (bounded by UPLOAD_CONCURRENCY). Continues past individual file
+    failures (records them, doesn't abort).
 
     Unlike Yandex.Disk (which uploads with overwrite=true, making retries
     harmless), Drive's file-create call always makes a NEW file — so a
     naive whole-batch retry on token expiry would leave duplicates behind.
-    Instead we refresh the access token at most once, in place, and retry
-    only the single item that hit the 401 — everything already uploaded
-    stays untouched.
+    Instead we refresh the access token at most once — an asyncio.Lock
+    makes that safe even if several concurrent uploads hit 401 at the same
+    time (only the first actually calls Google; the rest just wait for it
+    and reuse the refreshed token) — and only the items that actually hit
+    the 401 get retried; everything already uploaded stays untouched.
     """
     folder_name = folder_name.strip()  # Drive folder names are plain metadata,
                                         # not a path, so no slash-stripping needed
-    access_token = tokens["access_token"]
+    access_token = account["access_token"]
+    account_id = account["id"]
     refreshed = False
+    refresh_lock = asyncio.Lock()
 
     async def refresh_once() -> str:
         nonlocal access_token, refreshed
-        if not refreshed:
-            new = await refresh_access_token(tokens["refresh_token"])
-            access_token = new["access_token"]
-            save_tokens(telegram_id, new["access_token"], new["refresh_token"])
-            refreshed = True
+        async with refresh_lock:
+            if not refreshed:
+                new = await refresh_access_token(account["refresh_token"])
+                access_token = new["access_token"]
+                update_account_tokens(account_id, new["access_token"], new["refresh_token"])
+                refreshed = True
         return access_token
 
-    results = []
+    sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)
+    results: list[dict | None] = [None] * len(items)
+
     async with aiohttp.ClientSession() as session:
         try:
             folder_id = await ensure_folder(session, access_token, folder_name)
@@ -376,31 +503,34 @@ async def _upload_all(tokens: dict, telegram_id: int, items: list[dict],
             access_token = await refresh_once()
             folder_id = await ensure_folder(session, access_token, folder_name)
 
-        for it in items:
-            try:
-                await upload_file(
-                    session, access_token, it["upload_path"],
-                    folder_id, it["upload_name"],
-                )
-                results.append({**it, "success": True, "error": None})
-                continue
-            except GoogleAuthError:
-                pass  # fall through to a single refresh-and-retry below
-            except Exception as e:
-                logging.error(f"upload failed for {it['upload_name']}: {e}")
-                results.append({**it, "success": False, "error": str(e)})
-                continue
+        async def _upload_one(index: int, it: dict) -> None:
+            async with sem:
+                try:
+                    await upload_file(
+                        session, access_token, it["upload_path"],
+                        folder_id, it["upload_name"],
+                    )
+                    results[index] = {**it, "success": True, "error": None}
+                    return
+                except GoogleAuthError:
+                    pass  # fall through to a single refresh-and-retry below
+                except Exception as e:
+                    logging.error(f"upload failed for {it['upload_name']}: {e}")
+                    results[index] = {**it, "success": False, "error": str(e)}
+                    return
 
-            try:
-                access_token = await refresh_once()
-                await upload_file(
-                    session, access_token, it["upload_path"],
-                    folder_id, it["upload_name"],
-                )
-                results.append({**it, "success": True, "error": None})
-            except Exception as e:
-                logging.error(f"upload failed for {it['upload_name']} after refresh: {e}")
-                results.append({**it, "success": False, "error": str(e)})
+                try:
+                    token = await refresh_once()
+                    await upload_file(
+                        session, token, it["upload_path"],
+                        folder_id, it["upload_name"],
+                    )
+                    results[index] = {**it, "success": True, "error": None}
+                except Exception as e:
+                    logging.error(f"upload failed for {it['upload_name']} after refresh: {e}")
+                    results[index] = {**it, "success": False, "error": str(e)}
+
+        await asyncio.gather(*[_upload_one(i, it) for i, it in enumerate(items)])
 
         url = await publish_and_get_url(session, access_token, folder_id)
     return results, url
@@ -418,8 +548,8 @@ async def on_folder_name(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    tokens = get_tokens(message.from_user.id)
-    if not tokens:
+    account = get_active_account(message.from_user.id)
+    if not account:
         await message.answer("Диск не подключён. /start чтобы подключить.")
         await state.clear()
         return
@@ -427,9 +557,7 @@ async def on_folder_name(message: Message, state: FSMContext):
     await message.answer(f"Загружаю в папку «{folder_name}»...")
 
     try:
-        results, link = await _upload_all(
-            tokens, message.from_user.id, items, folder_name
-        )
+        results, link = await _upload_all(account, items, folder_name)
     except Exception as e:
         logging.exception("upload failed")
         await message.answer(f"Ошибка при загрузке: {e}")
@@ -483,10 +611,11 @@ async def oauth_callback(request: web.Request) -> web.Response:
         return web.Response(text=f"Отказано в доступе: {error}", content_type="text/plain")
     try:
         telegram_id, access_token, refresh_token = await exchange_code(state, code)
-        save_tokens(telegram_id, access_token, refresh_token)
+        email = await get_user_email(access_token)
+        add_or_update_account(telegram_id, email, access_token, refresh_token)
         await bot.send_message(
             telegram_id,
-            "Google Drive подключён ✅ Теперь пришли фото или файлы."
+            f"Google Drive подключён ✅ ({email})\nТеперь пришли фото или файлы."
         )
         return web.Response(
             text="Готово! Диск подключён. Можешь вернуться в Telegram.",
@@ -513,8 +642,17 @@ async def run_web():
     logging.info(f"web server on :{config.PORT}")
 
 
+BOT_COMMANDS = [
+    BotCommand(command="start", description="Подключить Диск / статус"),
+    BotCommand(command="accounts", description="Аккаунты: список и переключение"),
+    BotCommand(command="settings", description="Настройки очистки и переименования"),
+    BotCommand(command="logout", description="Отключить все аккаунты"),
+]
+
+
 async def main():
     os.makedirs(config.TEMP_DIR, exist_ok=True)
+    await bot.set_my_commands(BOT_COMMANDS)
     await run_web()
     await dp.start_polling(bot)
 
